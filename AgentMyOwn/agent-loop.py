@@ -84,6 +84,7 @@ def run_bash(command:str):
         )
         
         out = (r.stdout + r.stderr).strip()
+        ##清理shell输出的正常输出和错误输出
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
         
@@ -91,5 +92,64 @@ def run_bash(command:str):
         return f"Error: {e}"
 
 def agent_loop(messages:list):
-    
+    while True :
+        response = client.message.create(
+            model = MODEL,
+            system = SYSTEM,
+            messages = messages,
+            tools = TOOLS,
+            max_tokens = 8000,
+        )
+        
+        messages.append(
+            {
+                "role":"assistant",
+                "content":response.content
+            }
+        )
+        
+        tool_call = []
+        
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_call.append(block)
+                
+        
+        if not tool_calls:
+            return 
+        
+        results = []
+        
+        for block in tool_calls:
+             print(f"\033[33m$ {block.input['command']}\033[0m")
+             output= run_bash(block.input["command"])
+             print(output[:200])
+             results.append({
+                 "type":"tool_result",
+                "tool_use_id" :"block.if=id",
+                "content":output 
+             })
+             
+            #  拿到本轮的回答进行组装 
+if __name__ == "__main__":
+    print("s01: Agent Loop")
+    print("Enter a question, press Enter to send. Type q to quit.\n")
 
+    history = []
+    while True:
+        try:
+            # \001/\002 tell Readline the ANSI escapes have zero display width.
+            query = input("\001\033[36m\002s01 >> \001\033[0m\002")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+        history.append({"role": "user", "content": query})
+        agent_loop(history)
+        # Print the model's final text response
+        response_content = history[-1]["content"]
+        if isinstance(response_content, list):
+            for block in response_content:
+                if getattr(block, "type", None) == "text":
+                    print(block.text)
+        print()           
