@@ -35,9 +35,9 @@ load_dotenv(override= True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN",None)
     
-client = Anthropic(base_url = (ANTHROPIC_BASE_URL))
+client = Anthropic(base_url = os.getenv("ANTHROPIC_BASE_URL"))
 
-MOEDL = os.environ["MODEL_ID"]
+MODEL = os.environ["MODEL_ID"]
 
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
@@ -63,7 +63,7 @@ TOOLS = [
                     "type":"string"
                 }
             },
-            "required":[]
+            "required":["command"]
         }
     }
 ]
@@ -77,14 +77,15 @@ def run_bash(command:str):
         r = subprocess.run(
             command,shell = True,
             cwd=os.getcwd(),
-            capture_ouput = True,
+            capture_output = True,
             text = True,
-            error = "replace",
-            timeout = "120",
+            errors = "replace",
+            timeout = 120,
         )
         
         out = (r.stdout + r.stderr).strip()
         ##清理shell输出的正常输出和错误输出
+        return out[:50000] or "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
         
@@ -93,7 +94,7 @@ def run_bash(command:str):
 
 def agent_loop(messages:list):
     while True :
-        response = client.message.create(
+        response = client.messages.create(
             model = MODEL,
             system = SYSTEM,
             messages = messages,
@@ -108,11 +109,11 @@ def agent_loop(messages:list):
             }
         )
         
-        tool_call = []
+        tool_calls = []
         
         for block in response.content:
             if block.type == "tool_use":
-                tool_call.append(block)
+                tool_calls.append(block)
                 
         
         if not tool_calls:
@@ -126,11 +127,12 @@ def agent_loop(messages:list):
              print(output[:200])
              results.append({
                  "type":"tool_result",
-                "tool_use_id" :"block.if=id",
+                "tool_use_id" :block.id,
                 "content":output 
              })
-             
-            #  拿到本轮的回答进行组装 
+
+        messages.append({"role": "user", "content": results})
+
 if __name__ == "__main__":
     print("s01: Agent Loop")
     print("Enter a question, press Enter to send. Type q to quit.\n")
