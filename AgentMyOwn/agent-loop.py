@@ -140,8 +140,9 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s01 >> \001\033[0m\002")
+            # \001/\002 are Readline markers; Windows input does not handle them.
+            query = input("\033[36ms01 >> \033[0m" if os.name == "nt"
+                          else "\001\033[36m\002s01 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -154,4 +155,4 @@ if __name__ == "__main__":
             for block in response_content:
                 if getattr(block, "type", None) == "text":
                     print(block.text)
-        print()           
+        print()
