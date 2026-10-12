@@ -43,14 +43,15 @@ WORKDIR = Path.cwd()
 
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
-    "Bash or PowerShell syntax"
+    "Bash or PowerShell syntax, and prefer dedicated file tools for file operations"
     if os.name == "nt"
     else "Unix-like: the bash tool runs the system shell"
 )
 
 SYSTEM = (
-    f"You are a coding agent at {os.getcwd()}. Environment: {ENVIRONMENT_PROMPT}. "
-    "Use bash to solve tasks. Act, don't explain."
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Before starting any multi-step task, use todo_write to plan your steps. "
+    "Update status as you go."
 )
 
 
@@ -151,7 +152,13 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
     # s02新增工具说明
-
+def run_todo_write(todos: list | str) -> str:
+    try:
+        output = TODO.update(todos)
+    except ValueError as e:
+        return f"Error: {e}"
+    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
+    return output
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -164,13 +171,16 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    # 新增todo工具并修改systempropmt
+    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "maxItems": 20, "items": {"type": "object", "properties": {"content": {"type": "string", "minLength": 1}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
-
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
+    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
 }
+
 # 新增工具查表的内容可以结合大模型的输出进行工具查表调用对应的函数，减少大模型输出错误的风险，使用Schema约束大模型调用工具输出的参数
 # 新增hook，将前后处理从agent_loop中抽离出来也就是说之前的loop是定时做任务的做定期检查现在单独抽离出来做成注册表更加可控
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
