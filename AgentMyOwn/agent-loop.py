@@ -14,8 +14,6 @@
 11.输出大模型回复
 """
 
-import ast
-import json
 import re
 import os 
 import subprocess
@@ -50,12 +48,97 @@ ENVIRONMENT_PROMPT = (
     else "Unix-like: the bash tool runs the system shell"
 )
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
-    "Before starting any multi-step task, use todo_write to plan your steps. "
-    "Update status as you go."
-)
+class SkillLoader:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.skills: dict[str, dict[str, str]] = {}
+        self.scan()
 
+    @staticmethod
+    def parse_frontmatter(text: str) -> tuple[dict, str]:
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].rstrip("\r\n") != "---":
+            return {}, text
+
+        closing_index = next(
+            (index for index, line in enumerate(lines[1:], start=1)
+             if line.rstrip("\r\n") == "---"),
+            None,
+        )
+        if closing_index is None:
+            return {}, text
+
+        frontmatter = "".join(lines[1:closing_index])
+        body = "".join(lines[closing_index + 1:]).strip()
+        try:
+            metadata = yaml.safe_load(frontmatter) or {}
+        except yaml.YAMLError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return metadata, body
+
+    def scan(self):
+        self.skills.clear()
+        if not self.skills_dir.exists():
+            return
+
+        skills_root = self.skills_dir.resolve()
+        for manifest in sorted(self.skills_dir.glob("*/SKILL.md")):
+            if (not manifest.is_file()
+                    or not manifest.resolve().is_relative_to(skills_root)):
+                continue
+            content = manifest.read_text(encoding="utf-8")
+            metadata, body = self.parse_frontmatter(content)
+            raw_name = metadata.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            name = name or manifest.parent.name
+            raw_description = metadata.get("description")
+            description = (raw_description.strip()
+                           if isinstance(raw_description, str) else "")
+            description = description or body.split("\n", 1)[0]
+            description = " ".join(str(description).lstrip("# ").split())
+            self.skills[name] = {
+                "name": name,
+                "description": description,
+                "content": content,
+            }
+
+    def catalog(self) -> str:
+        if not self.skills:
+            return "(no skills found)"
+        return "\n".join(
+            f"- {skill['name']}: {skill['description']}"
+            for skill in self.skills.values()
+        )
+
+    def load(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if skill:
+            return skill["content"]
+        available = ", ".join(self.skills) or "none"
+        return f"Error: Unknown skill '{name}'. Available: {available}"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+
+def build_system_prompt() -> str:
+    return (
+        f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+        "Use tools to solve tasks. "
+        "Act, don't explain.\n\n"
+        f"Skills available:\n{SKILL_LOADER.catalog()}\n\n"
+        "Use load_skill to read the full instructions when a skill applies."
+    )
+
+
+SYSTEM = build_system_prompt()
+
+SUB_SYSTEM = (
+    f"You are a coding agent at {WORKDIR}. Environment: {ENVIRONMENT_PROMPT}. "
+    "Complete the given task, then return a concise final answer."
+)
 
 # TOOLS = [
 #     {
@@ -73,43 +156,22 @@ SYSTEM = (
 #     }
 # ]
 # s02新增工具定义的schema,声明对应工具执行类型
-
-
-def run_bash(command:str):
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any( d in command for d in dangerous):
-        return "危险指令！！！！！！！！"
-    
+# base_tools 给subagent做工具隔离
+def run_bash(command: str) -> str:
     try:
-        r = subprocess.run(
-            command,shell = True,
-            cwd=os.getcwd(),
-            capture_output = True,
-            text = True,
-            errors = "replace",
-            timeout = 120,
+        result = subprocess.run(
+            command, shell=True, cwd=WORKDIR,
+            capture_output=True, text=True, errors="replace", timeout=120,
         )
-        
-        out = (r.stdout + r.stderr).strip()
-        ##清理shell输出的正常输出和错误输出
-        return out[:50000] or "(no output)"
+        output = (result.stdout + result.stderr).strip()
+        return output[:50000] if output else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-        
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
-    
-
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
 
 
 def run_read(path: str, limit: int | None = None) -> str:
     try:
-        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
+        lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -119,7 +181,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 def run_write(path: str, content: str) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = (WORKDIR / path).resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
@@ -129,7 +191,7 @@ def run_write(path: str, content: str) -> str:
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = (WORKDIR / path).resolve()
         text = file_path.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
@@ -140,10 +202,10 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
-    import glob as g
+    import glob
     try:
         matches = sorted({
-            match for match in g.glob(
+            match for match in glob.glob(
                 pattern, root_dir=WORKDIR, recursive=True)
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR)
         })
@@ -153,80 +215,9 @@ def run_glob(pattern: str) -> str:
         return "\n".join(shown) if shown else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
-    # s02新增工具说明
 
 
-class TodoManager:
-    def __init__(self):
-        self.items: list[dict] = []
-
-    def update(self, todos: list | str) -> str:
-        if isinstance(todos, str):
-            try:
-                todos = json.loads(todos)
-            except json.JSONDecodeError:
-                try:
-                    todos = ast.literal_eval(todos)
-                except (SyntaxError, ValueError) as e:
-                    raise ValueError("todos must be a list or JSON array string") from e
-
-        if not isinstance(todos, list):
-            raise ValueError("todos must be a list")
-        if len(todos) > 20:
-            raise ValueError("Max 20 todos allowed")
-
-        validated = []
-        in_progress_count = 0
-        for index, todo in enumerate(todos):
-            if not isinstance(todo, dict):
-                raise ValueError(f"todos[{index}] must be an object")
-
-            content = str(todo.get("content", "")).strip()
-            status = str(todo.get("status", "pending")).lower()
-            if not content:
-                raise ValueError(f"todos[{index}] requires content")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"todos[{index}] has invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"content": content, "status": status})
-
-        if in_progress_count > 1:
-            raise ValueError("Only one todo can be in_progress at a time")
-
-        self.items = validated
-        return self.render()
-
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
-
-        lines = []
-        for todo in self.items:
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[todo["status"]]
-            lines.append(f"{marker} {todo['content']}")
-
-        done = sum(todo["status"] == "completed" for todo in self.items)
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-
-
-TODO = TodoManager()
-
-
-def run_todo_write(todos: list | str) -> str:
-    try:
-        output = TODO.update(todos)
-    except ValueError as e:
-        return f"Error: {e}"
-    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
-    return output
-
-TOOLS = [
+BASE_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -237,15 +228,100 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-    # 新增todo工具并修改systempropmt
-    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
-     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "maxItems": 20, "items": {"type": "object", "properties": {"content": {"type": "string", "minLength": 1}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
 ]
 
-TOOL_HANDLERS = {
-    "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+BASE_HANDLERS = {
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
 }
+
+
+    # s02新增工具说明
+def run_todo_write(todos: list | str) -> str:
+    try:
+        output = TODO.update(todos)
+    except ValueError as e:
+        return f"Error: {e}"
+    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
+    return output
+
+
+SUB_TOOLS = list(BASE_TOOLS)
+SUB_HANDLERS = dict(BASE_HANDLERS)
+
+
+def extract_text(content) -> str:
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in content
+        if getattr(block, "type", None) == "text"
+    )
+
+# 创建subagent工具
+#单独隔离消息列表
+#单独隔离工具
+#设置最大轮次
+#将消息append tool_result
+
+def run_subagent(prompt: str) -> str:
+    print("\n\033[35m[Subagent started]\033[0m")
+    messages = [{"role": "user", "content": prompt}]
+
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUB_SYSTEM,
+            messages=messages,
+            tools=SUB_TOOLS,
+            max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            print("\033[35m[Subagent done]\033[0m")
+            return extract_text(response.content) or "(no summary)"
+
+        results = []
+        for block in tool_calls:
+            output = execute_tool(block, SUB_HANDLERS)
+            print(f"  \033[90m[sub] {block.name}: {output[:100]}\033[0m")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            })
+        messages.append({"role": "user", "content": results})
+
+    print("\033[35m[Subagent stopped]\033[0m")
+    return "Subagent stopped after 30 turns without a final answer."
+
+
+
+TASK_TOOL = {
+    "name": "task",
+    "description": "Run a subagent with fresh conversation context and return its final text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string", "minLength": 1}},
+        "required": ["prompt"],
+    },
+}
+
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+
 
 # 新增工具查表的内容可以结合大模型的输出进行工具查表调用对应的函数，减少大模型输出错误的风险，使用Schema约束大模型调用工具输出的参数
 # 新增hook，将前后处理从agent_loop中抽离出来也就是说之前的loop是定时做任务的做定期检查现在单独抽离出来做成注册表更加可控
@@ -360,12 +436,12 @@ def large_output_hook(block, output):
         print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
     return None
 
-# UserPromptSubmit hook: log user input before it reaches the LLM
+# 打印用户输入的消息
 def context_inject_hook(query: str):
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None
 
-# Stop hook: print summary when loop is about to exit
+# 会话结束时总结
 def summary_hook(messages: list):
     tool_count = sum(1 for m in messages
                      for b in (m.get("content") if isinstance(m.get("content"), list) else [])
@@ -434,6 +510,17 @@ def agent_loop(messages:list):
              })
 
         messages.append({"role": "user", "content": results})
+        
+
+# 上下文压缩：
+# 上下文溢出很大的原因是由于工具调用占比过高，tool_result使用次数较多
+# 首先需要解决工具调用占用上下文的问题
+# 1.将工具结果输出的内容做判断，当输出的内容大于50000个字符的时候将其变成大文件，存储，暴露给大模型desprtions
+# 2.对于重复的调用的工具，只保留最近调用的结果作为更新
+3.删除上下文的中间部分，保留早期记忆和近期结果
+4.旧命令可以重新执行
+当上下文执行完之后还是超出了，就使用大模型进行压缩，将过去的历史记录保存
+因为大模型的输入token不完全等于程序输入的字符数量所以会有
 
 if __name__ == "__main__":
     print("s01: Agent Loop")
@@ -442,7 +529,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            # \001/\002 are Readline markers; Windows input does not handle them.
+            
             query = input("\033[36ms01 >> \033[0m" if os.name == "nt"
                           else "\001\033[36m\002s01 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
@@ -452,7 +539,7 @@ if __name__ == "__main__":
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
-        # Print the model's final text response
+        
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
