@@ -18,6 +18,7 @@ import re
 import os 
 import subprocess
 from pathlib import Path
+import yaml
 
 try:
     import readline
@@ -40,6 +41,7 @@ client = Anthropic(base_url = os.getenv("ANTHROPIC_BASE_URL"))
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
+SKILLS_DIR = WORKDIR / "skills"
 
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
@@ -300,6 +302,7 @@ def run_subagent(prompt: str) -> str:
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
+                "is_error": output.startswith(("Error:", "Unknown:", "Permission denied")),
                 "content": output,
             })
         messages.append({"role": "user", "content": results})
@@ -319,8 +322,11 @@ TASK_TOOL = {
     },
 }
 
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+TOOLS = [*BASE_TOOLS, TASK_TOOL,
+    {"name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent, "load_skill": SKILL_LOADER.load}
 
 
 # 新增工具查表的内容可以结合大模型的输出进行工具查表调用对应的函数，减少大模型输出错误的风险，使用Schema约束大模型调用工具输出的参数
@@ -455,6 +461,20 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
+
+def execute_tool(block, handlers: dict) -> str:
+    try:
+        blocked = trigger_hooks("PreToolUse", block)
+        if blocked is not None:
+            return str(blocked)
+        handler = handlers.get(block.name)
+        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+    except TypeError as e:
+        output = f"Error: Invalid arguments for {block.name}: {e}. Follow the tool input_schema and provide all required fields."
+    trigger_hooks("PostToolUse", block, output)
+    return str(output)
+
+
 def agent_loop(messages:list):
     while True :
         response = client.messages.create(
@@ -517,10 +537,10 @@ def agent_loop(messages:list):
 # 首先需要解决工具调用占用上下文的问题
 # 1.将工具结果输出的内容做判断，当输出的内容大于50000个字符的时候将其变成大文件，存储，暴露给大模型desprtions
 # 2.对于重复的调用的工具，只保留最近调用的结果作为更新
-3.删除上下文的中间部分，保留早期记忆和近期结果
-4.旧命令可以重新执行
-当上下文执行完之后还是超出了，就使用大模型进行压缩，将过去的历史记录保存
-因为大模型的输入token不完全等于程序输入的字符数量所以会有
+# 3.删除上下文的中间部分，保留早期记忆和近期结果
+# 4.旧命令可以重新执行
+# 当上下文执行完之后还是超出了，就使用大模型进行压缩，将过去的历史记录保存
+# 因为大模型的输入token不完全等于程序输入的字符数量所以会有
 
 if __name__ == "__main__":
     print("s01: Agent Loop")
