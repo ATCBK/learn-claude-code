@@ -14,10 +14,18 @@
 11.输出大模型回复
 """
 
-import re
+import json
 import os 
+import re
+import secrets
 import subprocess
+import threading
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
+
+import yaml
 
 try:
     import readline
@@ -40,6 +48,11 @@ client = Anthropic(base_url = os.getenv("ANTHROPIC_BASE_URL"))
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
+MEMORY_DIR = WORKDIR / ".memory"
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+SKILLS_DIR = WORKDIR / "skills"
+TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
 ENVIRONMENT_PROMPT = (
     "Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix "
@@ -1174,62 +1187,514 @@ register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
-def agent_loop(messages:list):
-    while True :
-        response = client.messages.create(
-            model = MODEL,
-            system = SYSTEM,
-            messages = messages,
-            tools = TOOLS,
-            max_tokens = 8000,
-        )
-        
-        messages.append(
-            {
-                "role":"assistant",
-                "content":response.content
-            }
-        )
-        
-        tool_calls = []
-        
-        for block in response.content:
-            if block.type == "tool_use":
-                tool_calls.append(block)
-                
-        
-        if not tool_calls:
-            force = trigger_hooks("Stop", messages)
-            if force:
-                messages.append({"role": "user", "content": force})
-                continue
-            return 
-        
-        results = []
-        
-        for block in tool_calls:
-             print(f"\033[33m> {block.name}\033[0m")
-             handler = TOOL_HANDLERS.get(block.name)
-             try:
-                 blocked = trigger_hooks("PreToolUse", block)
-                 if blocked is not None:
-                     results.append({"type": "tool_result", "tool_use_id": block.id,
-                                     "is_error": True, "content": str(blocked)})
-                     continue
-                 output = handler(**block.input) if handler else f"Unknown: {block.name}"
-             except TypeError as e:
-                 output = f"Error: Invalid arguments for {block.name}: {e}. Follow the tool input_schema and provide all required fields."
-             trigger_hooks("PostToolUse", block, output)
-             print(output[:200])
-             results.append({
-                 "type":"tool_result",
-                "tool_use_id" :block.id,
-                "is_error": output.startswith(("Error:", "Unknown:")),
-                "content":output 
-             })
+# 慢工具放到后台执行，等待bash+True双重验证
 
-        messages.append({"role": "user", "content": results})
-        
+class BackgroundManager:
+    def __init__(self):
+        self.tasks: dict[str, dict] = {}
+        self.results: dict[str, str] = {}
+        self._ready: list[str] = []
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def start(self, block) -> str:
+        if block.name != "bash":
+            raise ValueError("Only Bash commands can run in the background")
+        command = block.input.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("Bash command cannot be empty")
+
+        with self._lock:
+            self._counter += 1
+            task_id = f"bg_{self._counter:04d}"
+            self.tasks[task_id] = {
+                "tool_use_id": block.id,
+                "command": command,
+                "status": "running",
+            }
+
+        thread = threading.Thread(
+            target=self._run,
+            args=(task_id, command),
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except Exception:
+            with self._lock:
+                self.tasks.pop(task_id, None)
+            raise
+        print(f"  [background] started {task_id}: {command[:60]}")
+        return task_id
+
+    def _run(self, task_id: str, command: str):
+        try:
+            output, exit_code = _run_bash_process(command)
+            result = _format_bash_result(output, exit_code)
+            status = "completed" if exit_code == 0 else "failed"
+        except Exception as error:
+            result = f"Error: {type(error).__name__}: {error}"
+            status = "failed"
+
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return
+            task["status"] = status
+            self.results[task_id] = result
+            self._ready.append(task_id)
+
+    def collect(self) -> list[str]:
+        with self._lock:
+            ready = []
+            for task_id in self._ready:
+                task = self.tasks.pop(task_id, None)
+                result = self.results.pop(task_id, "")
+                if task is not None:
+                    ready.append((task_id, task, result))
+            self._ready.clear()
+
+        notifications = []
+        for task_id, task, result in ready:
+            notifications.append(
+                f"<task_notification>\n"
+                f"  <task_id>{task_id}</task_id>\n"
+                f"  <status>{task['status']}</status>\n"
+                f"  <command>{task['command']}</command>\n"
+                f"  <summary>{result[:500]}</summary>\n"
+                f"</task_notification>"
+            )
+            print(f"  [background] collected {task_id}: {task['status']}")
+        return notifications
+
+
+BACKGROUND = BackgroundManager()
+background_tasks = BACKGROUND.tasks
+background_results = BACKGROUND.results
+
+
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    return (
+        tool_name == "bash"
+        and tool_input.get("run_in_background") is True
+    )
+
+
+def start_background_task(block) -> str:
+    return BACKGROUND.start(block)
+
+
+def collect_background_results() -> list[str]:
+    return BACKGROUND.collect()
+
+
+def inject_background_results(messages: list) -> int:
+    notifications = collect_background_results()
+    if not notifications:
+        return 0
+
+    blocks = [{"type": "text", "text": item} for item in notifications]
+    if messages and messages[-1].get("role") == "user":
+        content = messages[-1].get("content", "")
+        if isinstance(content, list):
+            content.extend(blocks)
+        else:
+            messages[-1]["content"] = [
+                {"type": "text", "text": str(content)},
+                *blocks,
+            ]
+    else:
+        messages.append({"role": "user", "content": blocks})
+    return len(notifications)
+
+
+def execute_tool(block) -> str:
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked is not None:
+        return str(blocked)
+
+    if should_run_background(block.name, block.input):
+        try:
+            task_id = start_background_task(block)
+            output = (
+                f"[Background task {task_id} started] "
+                "The result will be collected on a later turn."
+            )
+        except Exception as error:
+            output = f"Error: {error}"
+    else:
+        output = call_tool(block)
+
+    trigger_hooks("PostToolUse", block, output)
+    return output
+
+# 时钟机制：
+
+
+@dataclass
+class CronJob:
+    id: str
+    cron: str
+    prompt: str
+    recurring: bool
+    durable: bool
+    pending_delivery: bool = False
+    last_fired: str | None = None
+
+
+scheduled_jobs: dict[str, CronJob] = {}
+cron_queue: list[CronJob] = []
+cron_lock = threading.RLock()
+
+
+def _cron_field_matches(field: str, value: int) -> bool:
+    if field == "*":
+        return True
+    if field.startswith("*/"):
+        return value % int(field[2:]) == 0
+    if "," in field:
+        return any(_cron_field_matches(part.strip(), value)
+                   for part in field.split(","))
+    if "-" in field:
+        start, end = field.split("-", 1)
+        return int(start) <= value <= int(end)
+    return value == int(field)
+
+
+def cron_matches(cron_expr: str, moment: datetime) -> bool:
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return False
+
+    minute, hour, day, month, weekday = fields
+    cron_weekday = (moment.weekday() + 1) % 7
+    if not (
+        _cron_field_matches(minute, moment.minute)
+        and _cron_field_matches(hour, moment.hour)
+        and _cron_field_matches(month, moment.month)
+    ):
+        return False
+
+    day_matches = _cron_field_matches(day, moment.day)
+    weekday_matches = _cron_field_matches(weekday, cron_weekday)
+    if day == "*" and weekday == "*":
+        return True
+    if day == "*":
+        return weekday_matches
+    if weekday == "*":
+        return day_matches
+    return day_matches or weekday_matches
+
+
+def _validate_cron_field(field: str, minimum: int, maximum: int) -> str | None:
+    if field == "*":
+        return None
+    if field.startswith("*/"):
+        step = field[2:]
+        if not step.isdigit() or int(step) <= 0:
+            return f"Invalid step: {field}"
+        return None
+    if "," in field:
+        for part in field.split(","):
+            error = _validate_cron_field(part.strip(), minimum, maximum)
+            if error:
+                return error
+        return None
+    if "-" in field:
+        start, end = field.split("-", 1)
+        if not start.isdigit() or not end.isdigit():
+            return f"Invalid range: {field}"
+        start_value, end_value = int(start), int(end)
+        if start_value > end_value:
+            return f"Range start is greater than end: {field}"
+        if start_value < minimum or end_value > maximum:
+            return f"Range {field} is outside [{minimum}-{maximum}]"
+        return None
+    if not field.isdigit():
+        return f"Invalid field: {field}"
+    value = int(field)
+    if value < minimum or value > maximum:
+        return f"Value {value} is outside [{minimum}-{maximum}]"
+    return None
+
+
+def validate_cron(cron_expr: str) -> str | None:
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return f"Expected 5 fields, got {len(fields)}"
+
+    field_rules = [
+        ("minute", 0, 59),
+        ("hour", 0, 23),
+        ("day-of-month", 1, 31),
+        ("month", 1, 12),
+        ("day-of-week", 0, 6),
+    ]
+    for field, (name, minimum, maximum) in zip(fields, field_rules):
+        error = _validate_cron_field(field, minimum, maximum)
+        if error:
+            return f"{name}: {error}"
+    return None
+
+
+def save_durable_jobs():
+    with cron_lock:
+        payload = [
+            asdict(job)
+            for job in scheduled_jobs.values()
+            if job.durable
+        ]
+        temporary = DURABLE_PATH.with_name(
+            f"{DURABLE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(temporary, DURABLE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def load_durable_jobs():
+    if not DURABLE_PATH.exists():
+        return
+    try:
+        payload = json.loads(DURABLE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("expected a JSON list")
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        print(f"  [cron] could not load {DURABLE_PATH.name}: {error}")
+        return
+
+    loaded = 0
+    with cron_lock:
+        for item in payload:
+            try:
+                job = CronJob(**item)
+                error = validate_cron(job.cron)
+                if error:
+                    raise ValueError(error)
+                if not job.id.startswith("cron_"):
+                    raise ValueError("invalid job ID")
+                if not job.prompt.strip():
+                    raise ValueError("prompt cannot be empty")
+            except (TypeError, ValueError) as error:
+                print(f"  [cron] skipped invalid saved job: {error}")
+                continue
+            scheduled_jobs[job.id] = job
+            if job.pending_delivery:
+                cron_queue.append(job)
+            loaded += 1
+    if loaded:
+        print(f"  [cron] loaded {loaded} durable job(s)")
+
+
+def new_cron_id() -> str:
+    for _ in range(100):
+        job_id = f"cron_{secrets.token_hex(4)}"
+        if job_id not in scheduled_jobs:
+            return job_id
+    raise RuntimeError("Could not allocate a cron job ID")
+
+
+def schedule_job(cron: str, prompt: str, recurring: bool = True,
+                 durable: bool = True) -> CronJob | str:
+    error = validate_cron(cron)
+    if error:
+        return error
+    if not prompt.strip():
+        return "Prompt cannot be empty"
+
+    with cron_lock:
+        job = CronJob(
+            id=new_cron_id(),
+            cron=cron,
+            prompt=prompt,
+            recurring=recurring,
+            durable=durable,
+        )
+        scheduled_jobs[job.id] = job
+        try:
+            if durable:
+                save_durable_jobs()
+        except Exception:
+            scheduled_jobs.pop(job.id, None)
+            raise
+    print(f"  [cron] scheduled {job.id}: {cron} -> {prompt[:60]}")
+    return job
+
+
+def cancel_job(job_id: str) -> str:
+    with cron_lock:
+        job = scheduled_jobs.get(job_id)
+        if job is None:
+            return f"Job {job_id} not found"
+
+        previous_queue = list(cron_queue)
+        scheduled_jobs.pop(job_id)
+        cron_queue[:] = [queued for queued in cron_queue if queued.id != job_id]
+        try:
+            if job.durable:
+                save_durable_jobs()
+        except Exception:
+            scheduled_jobs[job_id] = job
+            cron_queue[:] = previous_queue
+            raise
+    print(f"  [cron] cancelled {job_id}")
+    return f"Cancelled {job_id}"
+
+
+def _enqueue_due_job(job: CronJob, minute_marker: str | None = None):
+    old_pending = job.pending_delivery
+    old_last_fired = job.last_fired
+    job.pending_delivery = True
+    if minute_marker is not None:
+        job.last_fired = minute_marker
+    try:
+        if job.durable:
+            save_durable_jobs()
+    except Exception:
+        job.pending_delivery = old_pending
+        job.last_fired = old_last_fired
+        raise
+    cron_queue.append(job)
+
+
+def poll_due_jobs(moment: datetime):
+    minute_marker = moment.strftime("%Y-%m-%d %H:%M")
+    with cron_lock:
+        for job in list(scheduled_jobs.values()):
+            try:
+                if job.pending_delivery or job.last_fired == minute_marker:
+                    continue
+                if cron_matches(job.cron, moment):
+                    _enqueue_due_job(job, minute_marker)
+                    print(f"  [cron] due {job.id}: {job.prompt[:60]}")
+            except Exception as error:
+                print(f"  [cron] could not enqueue {job.id}: {error}")
+
+
+def consume_cron_queue() -> list[CronJob]:
+    with cron_lock:
+        jobs = list(cron_queue)
+        cron_queue.clear()
+    return jobs
+
+
+def acknowledge_cron_jobs(jobs: list[CronJob]):
+    changed: list[tuple[CronJob, bool]] = []
+    removed: list[CronJob] = []
+    with cron_lock:
+        for delivered in jobs:
+            current = scheduled_jobs.get(delivered.id)
+            if current is None:
+                continue
+            changed.append((current, current.pending_delivery))
+            if current.recurring:
+                current.pending_delivery = False
+            else:
+                removed.append(current)
+                scheduled_jobs.pop(current.id)
+
+        try:
+            if any(job.durable for job, _ in changed):
+                save_durable_jobs()
+        except Exception:
+            for job in removed:
+                scheduled_jobs[job.id] = job
+            for job, pending in changed:
+                job.pending_delivery = pending
+            queued_ids = {job.id for job in cron_queue}
+            for job, _ in changed:
+                if job.id not in queued_ids:
+                    cron_queue.append(job)
+            raise
+
+
+def restore_cron_jobs(jobs: list[CronJob]):
+    with cron_lock:
+        queued_ids = {job.id for job in cron_queue}
+        for delivered in jobs:
+            current = scheduled_jobs.get(delivered.id)
+            if current is None:
+                continue
+            current.pending_delivery = True
+            if current.id not in queued_ids:
+                cron_queue.append(current)
+                queued_ids.add(current.id)
+
+
+def has_cron_queue() -> bool:
+    with cron_lock:
+        return bool(cron_queue)
+
+
+def run_schedule_cron(cron: str, prompt: str, recurring: bool = True,
+                      durable: bool = True) -> str:
+    result = schedule_job(cron, prompt, recurring, durable)
+    if isinstance(result, str):
+        return f"Error: {result}"
+    return f"Scheduled {result.id}: {cron} -> {prompt}"
+
+
+def run_list_crons() -> str:
+    with cron_lock:
+        jobs = list(scheduled_jobs.values())
+    if not jobs:
+        return "No cron jobs."
+
+    lines = []
+    for job in jobs:
+        frequency = "recurring" if job.recurring else "one-shot"
+        storage = "durable" if job.durable else "session"
+        lines.append(
+            f"{job.id}: {job.cron} -> {job.prompt[:60]} "
+            f"[{frequency}, {storage}]"
+        )
+    return "\n".join(lines)
+
+
+def run_cancel_cron(job_id: str) -> str:
+    return cancel_job(job_id)
+
+
+TOOLS.extend([
+    {"name": "schedule_cron",
+     "description": "Schedule a prompt with a 5-field cron expression.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "cron": {"type": "string"},
+                          "prompt": {"type": "string"},
+                          "recurring": {"type": "boolean"},
+                          "durable": {"type": "boolean"}},
+                      "required": ["cron", "prompt"]}},
+    {"name": "list_crons", "description": "List scheduled cron jobs.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "cancel_cron", "description": "Cancel a cron job by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"job_id": {"type": "string"}},
+                      "required": ["job_id"]}},
+])
+
+TOOL_HANDLERS.update({
+    "schedule_cron": run_schedule_cron,
+    "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
+})
+
+
+def execute_tool(block) -> str:
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked is not None:
+        return str(blocked)
+
+    handler = TOOL_HANDLERS.get(block.name)
+    try:
+        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+    except Exception as error:
+        output = f"Error: {error}"
+    trigger_hooks("PostToolUse", block, output)
+    return str(output)
+
 
 # 上下文压缩：
 # 上下文溢出很大的原因是由于工具调用占比过高，tool_result使用次数较多
@@ -1522,12 +1987,70 @@ class ContextCompactor:
 COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 MAX_REACTIVE_RETRIES = 1
 
+def agent_loop(messages:list):
+    while True :
+        response = client.messages.create(
+            model = MODEL,
+            system = SYSTEM,
+            messages = messages,
+            tools = TOOLS,
+            max_tokens = 8000,
+        )
+        
+        messages.append(
+            {
+                "role":"assistant",
+                "content":response.content
+            }
+        )
+        
+        tool_calls = []
+        
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_calls.append(block)
+                
+        
+        if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            return 
+        
+        results = []
+        
+        for block in tool_calls:
+             print(f"\033[33m> {block.name}\033[0m")
+             handler = TOOL_HANDLERS.get(block.name)
+             try:
+                 blocked = trigger_hooks("PreToolUse", block)
+                 if blocked is not None:
+                     results.append({"type": "tool_result", "tool_use_id": block.id,
+                                     "is_error": True, "content": str(blocked)})
+                     continue
+                 output = handler(**block.input) if handler else f"Unknown: {block.name}"
+             except TypeError as e:
+                 output = f"Error: Invalid arguments for {block.name}: {e}. Follow the tool input_schema and provide all required fields."
+             trigger_hooks("PostToolUse", block, output)
+             print(output[:200])
+             results.append({
+                 "type":"tool_result",
+                "tool_use_id" :block.id,
+                "is_error": output.startswith(("Error:", "Unknown:")),
+                "content":output 
+             })
+
+        messages.append({"role": "user", "content": results})
+        
+
+
 if __name__ == "__main__":
     print("Enter a question, press Enter to send. Type q to quit.\n")
-    relevant_memories = load_memories(messages)
+    history = []
+    relevant_memories = load_memories(history)
     system = build_system(relevant_memories)
 
-    history = []
     while True:
         try:
             
