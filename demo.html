@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>待办清单 · Demo</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel-2: #1e222d;
+    --line: #2a2f3d;
+    --text: #e6e9ef;
+    --muted: #8b93a7;
+    --accent: #6c8cff;
+    --accent-soft: rgba(108, 140, 255, 0.16);
+    --danger: #ff6b6b;
+    --ok: #3ddc97;
+    --radius: 14px;
+    --shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  }
+  [data-theme="light"] {
+    --bg: #f4f6fb;
+    --panel: #ffffff;
+    --panel-2: #f0f3fa;
+    --line: #e2e7f2;
+    --text: #1a1f2b;
+    --muted: #6b7385;
+    --accent: #4361ee;
+    --accent-soft: rgba(67, 97, 238, 0.1);
+    --shadow: 0 10px 30px rgba(23, 35, 74, 0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: radial-gradient(1200px 600px at 80% -10%, var(--accent-soft), transparent 60%), var(--bg);
+    color: var(--text);
+    font: 15px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+    transition: background 0.25s, color 0.25s;
+  }
+  .app {
+    width: 100%;
+    max-width: 620px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    box-shadow: var(--shadow);
+    padding: 26px;
+  }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: 0.4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
+  .spacer { flex: 1; }
+  .icon-btn {
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    color: var(--text);
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 16px;
+    display: grid; place-items: center;
+    transition: 0.15s;
+  }
+  .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  form.add { display: flex; gap: 10px; margin-bottom: 14px; }
+  input[type="text"] {
+    flex: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    padding: 12px 14px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    outline: none;
+    transition: 0.15s;
+  }
+  input[type="text"]:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  input::placeholder { color: var(--muted); }
+  .btn {
+    border: none;
+    background: var(--accent);
+    color: #fff;
+    padding: 0 18px;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  .btn:hover { filter: brightness(1.1); }
+  .btn:active { transform: translateY(1px); }
+
+  .toolbar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--muted);
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  .chip:hover { color: var(--text); border-color: var(--muted); }
+  .chip[aria-pressed="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  ul.list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  li.item {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    animation: pop 0.18s ease-out;
+  }
+  @keyframes pop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  li.item .box {
+    width: 20px; height: 20px; flex: none;
+    border-radius: 6px;
+    border: 2px solid var(--muted);
+    cursor: pointer;
+    display: grid; place-items: center;
+    transition: 0.15s;
+  }
+  li.item.done .box { background: var(--ok); border-color: var(--ok); }
+  li.item.done .box::after { content: "✓"; color: #06281c; font-size: 13px; font-weight: 900; }
+  li.item .txt { flex: 1; word-break: break-word; }
+  li.item.done .txt { color: var(--muted); text-decoration: line-through; }
+  li.item .del {
+    border: none; background: transparent; color: var(--muted);
+    cursor: pointer; font-size: 16px; padding: 4px 6px; border-radius: 8px;
+    opacity: 0; transition: 0.15s;
+  }
+  li.item:hover .del { opacity: 1; }
+  li.item .del:hover { color: var(--danger); background: rgba(255, 107, 107, 0.1); }
+
+  .empty { text-align: center; color: var(--muted); padding: 34px 0; font-size: 14px; }
+
+  footer {
+    display: flex; align-items: center; gap: 12px;
+    margin-top: 18px; padding-top: 16px;
+    border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 13px;
+  }
+  .progress { flex: 1; height: 6px; background: var(--panel-2); border-radius: 99px; overflow: hidden; }
+  .progress > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--ok)); transition: width 0.3s; }
+  .clear {
+    border: 1px solid var(--line); background: transparent; color: var(--muted);
+    border-radius: 10px; padding: 6px 10px; font-size: 12.5px; cursor: pointer;
+  }
+  .clear:hover { color: var(--danger); border-color: var(--danger); }
+  @media (max-width: 480px) {
+    body { padding: 16px 10px; }
+    .app { padding: 18px; border-radius: 16px; }
+  }
+</style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>待办清单</h1>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="themeBtn" title="切换主题" aria-label="切换主题">◐</button>
+    </header>
+    <p class="sub">按 Enter 添加 · 点击方框完成 · 数据保存在本地</p>
+
+    <form class="add" id="addForm" autocomplete="off">
+      <input type="text" id="input" placeholder="今天要做点什么？" maxlength="120" />
+      <button class="btn" type="submit">添加</button>
+    </form>
+
+    <div class="toolbar" role="group" aria-label="筛选">
+      <button class="chip" data-filter="all" aria-pressed="true">全部</button>
+      <button class="chip" data-filter="active" aria-pressed="false">未完成</button>
+      <button class="chip" data-filter="done" aria-pressed="false">已完成</button>
+    </div>
+
+    <ul class="list" id="list"></ul>
+    <div class="empty" id="empty" hidden>还没有任务，先添加一条吧 ✨</div>
+
+    <footer>
+      <span id="stat">0 / 0</span>
+      <div class="progress"><i id="bar"></i></div>
+      <button class="clear" id="clearDone">清除已完成</button>
+    </footer>
+  </main>
+
+<script>
+(function () {
+  "use strict";
+
+  const KEY = "demo.todos.v1";
+  const THEME_KEY = "demo.theme";
+
+  const $ = (s) => document.querySelector(s);
+  const listEl = $("#list");
+  const emptyEl = $("#empty");
+  const inputEl = $("#input");
+  const statEl = $("#stat");
+  const barEl = $("#bar");
+
+  let todos = load();
+  let filter = "all";
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      if (!raw) return [];
+      const data = JSON.parse(raw);
+      return Array.isArray(data) ? data : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function save() {
+    try { localStorage.setItem(KEY, JSON.stringify(todos)); } catch (e) {}
+  }
+
+  function visible() {
+    if (filter === "active") return todos.filter((t) => !t.done);
+    if (filter === "done") return todos.filter((t) => t.done);
+    return todos;
+  }
+
+  function render() {
+    const items = visible();
+    listEl.innerHTML = "";
+
+    for (const t of items) {
+      const li = document.createElement("li");
+      li.className = "item" + (t.done ? " done" : "");
+      li.dataset.id = t.id;
+
+      const box = document.createElement("button");
+      box.className = "box";
+      box.type = "button";
+      box.setAttribute("aria-label", t.done ? "标记为未完成" : "标记为完成");
+      box.addEventListener("click", () => toggle(t.id));
+
+      const txt = document.createElement("span");
+      txt.className = "txt";
+      txt.textContent = t.text;
+
+      const del = document.createElement("button");
+      del.className = "del";
+      del.type = "button";
+      del.textContent = "✕";
+      del.title = "删除";
+      del.addEventListener("click", () => remove(t.id));
+
+      li.append(box, txt, del);
+      listEl.appendChild(li);
+    }
+
+    emptyEl.hidden = items.length > 0;
+    if (items.length === 0) {
+      emptyEl.textContent = todos.length === 0
+        ? "还没有任务，先添加一条吧 ✨"
+        : "这个筛选下没有任务";
+    }
+
+    const total = todos.length;
+    const done = todos.filter((t) => t.done).length;
+    statEl.textContent = done + " / " + total;
+    barEl.style.width = total ? (done / total) * 100 + "%" : "0%";
+    save();
+  }
+
+  function add(text) {
+    const v = text.trim();
+    if (!v) return;
+    todos.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), text: v, done: false });
+    render();
+  }
+
+  function toggle(id) {
+    const t = todos.find((x) => x.id === id);
+    if (t) { t.done = !t.done; render(); }
+  }
+
+  function remove(id) {
+    todos = todos.filter((x) => x.id !== id);
+    render();
+  }
+
+  $("#addForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    add(inputEl.value);
+    inputEl.value = "";
+    inputEl.focus();
+  });
+
+  document.querySelectorAll(".chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      filter = chip.dataset.filter;
+      document.querySelectorAll(".chip").forEach((c) =>
+        c.setAttribute("aria-pressed", String(c === chip))
+      );
+      render();
+    });
+  });
+
+  $("#clearDone").addEventListener("click", () => {
+    todos = todos.filter((t) => !t.done);
+    render();
+  });
+
+  // 主题
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    try { localStorage.setItem(THEME_KEY, theme); } catch (e) {}
+  }
+  applyTheme(localStorage.getItem(THEME_KEY) || "dark");
+  $("#themeBtn").addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

@@ -962,16 +962,71 @@ BASE_TOOLS = [
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
 
+BASE_TOOLS.extend([
+    {"name": "todo_write", "description": "Create and manage a task list for your current coding session.",
+     "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "maxItems": 20, "items": {"type": "object", "properties": {"content": {"type": "string", "minLength": 1}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["content", "status"]}}}, "required": ["todos"]}},
+    {"name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+])
+
 BASE_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "load_skill": SKILL_LOADER.load,
 }
 
 
     # s02新增工具说明
+class TodoManager:
+    def __init__(self):
+        self.items: list[dict] = []
+
+    def update(self, todos: list | str) -> str:
+        if isinstance(todos, str):
+            todos = json.loads(todos)
+        if not isinstance(todos, list):
+            raise ValueError("todos must be a list")
+        if len(todos) > 20:
+            raise ValueError("Max 20 todos allowed")
+
+        validated = []
+        in_progress_count = 0
+        for index, todo in enumerate(todos):
+            if not isinstance(todo, dict):
+                raise ValueError(f"todos[{index}] must be an object")
+            content = str(todo.get("content", "")).strip()
+            status = str(todo.get("status", "pending")).lower()
+            if not content:
+                raise ValueError(f"todos[{index}] requires content")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"todos[{index}] has invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"content": content, "status": status})
+
+        if in_progress_count > 1:
+            raise ValueError("Only one todo can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for todo in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[todo["status"]]
+            lines.append(f"{marker} {todo['content']}")
+        done = sum(todo["status"] == "completed" for todo in self.items)
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
+
+
 def run_todo_write(todos: list | str) -> str:
     try:
         output = TODO.update(todos)
@@ -979,6 +1034,9 @@ def run_todo_write(todos: list | str) -> str:
         return f"Error: {e}"
     print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
     return output
+
+
+BASE_HANDLERS["todo_write"] = run_todo_write
 
 
 SUB_TOOLS = list(BASE_TOOLS)
@@ -1189,6 +1247,36 @@ register_hook("Stop", summary_hook)
 
 # 慢工具放到后台执行，等待bash+True双重验证
 
+def _run_bash_process(command: str) -> tuple[str, int | None]:
+    try:
+        result = subprocess.run(
+            command, shell=True, cwd=WORKDIR,
+            capture_output=True, text=True, errors="replace", timeout=120,
+        )
+        output = (result.stdout + result.stderr).strip()
+        return (output[:50000] if output else "(no output)"), result.returncode
+    except subprocess.TimeoutExpired:
+        return "Error: Timeout (120s)", None
+    except OSError as error:
+        return f"Error: {type(error).__name__}: {error}", None
+
+
+def _format_bash_result(output: str, exit_code: int | None) -> str:
+    if exit_code in (0, None):
+        return output
+    return f"Error: command exited with status {exit_code}\n{output}"
+
+
+def call_tool(block, handlers=None) -> str:
+    handlers = TOOL_HANDLERS if handlers is None else handlers
+    handler = handlers.get(block.name)
+    try:
+        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+    except Exception as error:
+        output = f"Error: {error}"
+    return str(output)
+
+
 class BackgroundManager:
     def __init__(self):
         self.tasks: dict[str, dict] = {}
@@ -1308,7 +1396,8 @@ def inject_background_results(messages: list) -> int:
     return len(notifications)
 
 
-def execute_tool(block) -> str:
+def execute_tool(block, handlers=None) -> str:
+    handlers = TOOL_HANDLERS if handlers is None else handlers
     blocked = trigger_hooks("PreToolUse", block)
     if blocked is not None:
         return str(blocked)
@@ -1323,7 +1412,7 @@ def execute_tool(block) -> str:
         except Exception as error:
             output = f"Error: {error}"
     else:
-        output = call_tool(block)
+        output = call_tool(block, handlers)
 
     trigger_hooks("PostToolUse", block, output)
     return output
@@ -1435,6 +1524,9 @@ def validate_cron(cron_expr: str) -> str | None:
         if error:
             return f"{name}: {error}"
     return None
+
+
+DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
 
 def save_durable_jobs():
@@ -1680,20 +1772,6 @@ TOOL_HANDLERS.update({
     "list_crons": run_list_crons,
     "cancel_cron": run_cancel_cron,
 })
-
-
-def execute_tool(block) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
-    if blocked is not None:
-        return str(blocked)
-
-    handler = TOOL_HANDLERS.get(block.name)
-    try:
-        output = handler(**block.input) if handler else f"Unknown: {block.name}"
-    except Exception as error:
-        output = f"Error: {error}"
-    trigger_hooks("PostToolUse", block, output)
-    return str(output)
 
 
 # 上下文压缩：
@@ -2046,15 +2124,14 @@ def agent_loop(messages:list):
 
 
 if __name__ == "__main__":
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("请输入问题，按q退出\n")
     history = []
     relevant_memories = load_memories(history)
     system = build_system(relevant_memories)
-
     while True:
         try:
             
-            query = input("\033[36ms01 >> \033[0m" if os.name == "nt"
+            query = input("\033[36moh-my-claude >> \033[0m" if os.name == "nt"
                           else "\001\033[36m\002s01 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
